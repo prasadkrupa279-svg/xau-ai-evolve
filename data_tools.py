@@ -13,11 +13,15 @@ and load_data() picks them up automatically.
 """
 from __future__ import annotations
 import os
+import glob
 import numpy as np
 import pandas as pd
 
 DEFAULT_FILES = ["GOLD_2023_2024.csv", "GOLD_2024_2025.csv", "GOLD_2025_2026.csv"]
 COLS = ["date", "time", "open", "high", "low", "close", "tickvol", "vol", "spread"]
+
+# MT/MT5 exports store SPREAD in POINTS. Gold (2-decimal) -> 1 point = $0.01.
+SPREAD_POINT = float(os.environ.get("SPREAD_POINT", "0.01"))
 
 
 def _read_one(path: str) -> pd.DataFrame:
@@ -33,9 +37,11 @@ def _read_one(path: str) -> pd.DataFrame:
 
 
 def load_data(data_dir: str = "data", files=None) -> pd.DataFrame | None:
-    files = files or DEFAULT_FILES
-    paths = [os.path.join(data_dir, f) for f in files]
-    paths = [p for p in paths if os.path.exists(p)]
+    if files:
+        paths = [os.path.join(data_dir, f) for f in files if os.path.exists(os.path.join(data_dir, f))]
+    else:
+        # glob ANY *.csv in the data dir so naming (e.g. "GOLD.i#_M1 2025 to 2026.csv") just works
+        paths = sorted(glob.glob(os.path.join(data_dir, "*.csv")))
     if not paths:
         return None
 
@@ -49,10 +55,9 @@ def load_data(data_dir: str = "data", files=None) -> pd.DataFrame | None:
         return None
     df = pd.concat(parts, ignore_index=True)
 
-    df["datetime"] = pd.to_datetime(
-        df["date"].astype(str) + " " + df["time"].astype(str),
-        errors="coerce",
-    )
+    # MT dates look like "2025.06.24" -> normalise to "2025-06-24"
+    dstr = df["date"].astype(str).str.replace(".", "-", regex=False)
+    df["datetime"] = pd.to_datetime(dstr + " " + df["time"].astype(str), errors="coerce")
     df = df.dropna(subset=["datetime"])
     for c in ("open", "high", "low", "close"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -61,7 +66,9 @@ def load_data(data_dir: str = "data", files=None) -> pd.DataFrame | None:
     df = df.drop_duplicates(subset="datetime", keep="last").reset_index(drop=True)
 
     df["vol"] = pd.to_numeric(df.get("tickvol", 0), errors="coerce").fillna(0.0)
-    df["spread"] = pd.to_numeric(df.get("spread", 0), errors="coerce").fillna(0.0)
+    # SPREAD column is in POINTS -> convert to dollars (gold 2-decimal)
+    sp = pd.to_numeric(df.get("spread", 0), errors="coerce").fillna(0.0)
+    df["spread"] = sp * SPREAD_POINT
     return df[["datetime", "open", "high", "low", "close", "vol", "spread"]].copy()
 
 

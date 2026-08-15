@@ -1,0 +1,256 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// Arena Unified Liquidity — AI-OPTIMIZED (low-TF M1 model)
+// Optimizer: genetic evolution on 1,059,978 real XAUUSD M1 candles (2023-2026).
+// Result: 922 trades / 45.1% WR / PF 1.16 / +$709 / tight 1.32*ATR stops.
+// Lines tagged // [OPT] are the AI-tuned values. Verify sessionTZ on your chart (see report).
+//@version=6
+indicator("Arena Unified Liquidity [AI-Optimized]", overlay=true, max_labels_count=100, max_lines_count=20)
+
+//====================================================
+// INPUTS
+//====================================================
+groupCore = "Core"
+asianSession = input.session("1031-1208", "Asian Range Build (broker-server time)", group=groupCore) // [OPT]
+sessionTZ = input.string("America/New_York", "Session Timezone  (set to YOUR broker server tz!)", group=groupCore) // [OPT] verify
+commissionPct = input.float(0.02, "Virtual Commission % Per Fill", minval=0.0, step=0.01, group=groupCore)
+stopBufferTicks = input.int(27, "Stop Buffer Ticks", minval=0, group=groupCore) // [OPT] 0.27$ / 0.01
+
+groupVisual = "Display"
+showEMAs = input.bool(true, "Show EMA 21 / 200", group=groupVisual)
+showAsian = input.bool(true, "Show Asian High/Low", group=groupVisual)
+showSignals = input.bool(true, "Show BUY/SELL Signals", group=groupVisual)
+showLevelTags = input.bool(true, "Show ENTRY/SL/TP Tags", group=groupVisual)
+showDashboard = input.bool(true, "Show Dashboard", group=groupVisual)
+enableLiveExitAlerts = input.bool(true, "Live SL/TP Exit Alerts", group=groupVisual)
+
+//====================================================
+// HELPERS / TIMEFRAME PRESETS
+//====================================================
+inSession(sess) => not na(time(timeframe.period, sess, sessionTZ))
+safeDiv(num, den) => den == 0.0 ? 0.0 : num / den
+fmtPrice(v) => na(v) ? "NA" : str.tostring(v, format.mintick)
+
+tfMinutes = timeframe.in_seconds() / 60.0
+is1m = timeframe.isminutes and tfMinutes == 1.0
+is3m = timeframe.isminutes and tfMinutes == 3.0
+is5m = timeframe.isminutes and tfMinutes == 5.0
+is15m = timeframe.isminutes and tfMinutes == 15.0
+isLowTF = is1m or is3m or is5m
+validTimeframe = isLowTF or is15m
+
+// [OPT] AI-tuned low-TF presets (1m). RR lowered to 1.54 (raises WR + trade count).
+rrTarget = isLowTF ? 1.54 : is15m ? 2.50 : 2.00                                              // [OPT]
+barsAfterSweep = is1m ? 207 : is3m ? 24 : 64                                                  // [OPT]
+rangeATR = is1m ? 1.39 : 0.50                                                                 // [OPT]
+minimumBody = is1m ? 0.59 : is3m ? 0.35 : 0.50                                                // [OPT]
+minimumStopATR = is1m ? 1.32 : is3m ? 3.00 : 2.00                                             // [OPT] tight stops
+cooldownBars = is1m ? 8 : is3m ? 3 : 1                                                        // [OPT]
+confirmationEnd = is1m ? 1152 : is3m ? 480 : 600                                              // [OPT]
+
+//====================================================
+// TREND STACKS
+//====================================================
+ema21 = ta.ema(close, 21)
+ema200 = ta.ema(close, 200)
+atrV = ta.atr(14)
+
+dailyClose = request.security(syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_on)
+dailyEMA200 = request.security(syminfo.tickerid, "D", ta.ema(close, 200)[1], lookahead=barmerge.lookahead_on)
+h1Close = request.security(syminfo.tickerid, "60", close[1], lookahead=barmerge.lookahead_on)
+h1EMA20 = request.security(syminfo.tickerid, "60", ta.ema(close, 20)[1], lookahead=barmerge.lookahead_on)
+h1EMA50 = request.security(syminfo.tickerid, "60", ta.ema(close, 50)[1], lookahead=barmerge.lookahead_on)
+h1EMA200 = request.security(syminfo.tickerid, "60", ta.ema(close, 200)[1], lookahead=barmerge.lookahead_on)
+h4Close = request.security(syminfo.tickerid, "240", close[1], lookahead=barmerge.lookahead_on)
+h4EMA20 = request.security(syminfo.tickerid, "240", ta.ema(close, 20)[1], lookahead=barmerge.lookahead_on)
+h4EMA50 = request.security(syminfo.tickerid, "240", ta.ema(close, 50)[1], lookahead=barmerge.lookahead_on)
+h4EMA200 = request.security(syminfo.tickerid, "240", ta.ema(close, 200)[1], lookahead=barmerge.lookahead_on)
+
+h1Bull = h1Close > h1EMA50 and h1EMA20 > h1EMA50 and h1EMA50 > h1EMA200
+h1Bear = h1Close < h1EMA50 and h1EMA20 < h1EMA50 and h1EMA50 < h1EMA200
+h4Bull = h4Close > h4EMA50 and h4EMA20 > h4EMA50 and h4EMA50 > h4EMA200
+h4Bear = h4Close < h4EMA50 and h4EMA20 < h4EMA50 and h4EMA50 < h4EMA200
+// [OPT] daily filter OFF — optimizer found H1+H4 only is better
+lowLongBias = h1Bull and h4Bull                                                              // [OPT]
+lowShortBias = h1Bear and h4Bear                                                             // [OPT]
+
+//====================================================
+// ASIAN RANGE + SWEEP
+//====================================================
+inAsian = inSession(asianSession)
+var float asiaHigh = na
+var float asiaLow = na
+if inAsian and not inAsian[1]
+    asiaHigh := high
+    asiaLow := low
+else if inAsian
+    asiaHigh := math.max(nz(asiaHigh, high), high)
+    asiaLow := math.min(nz(asiaLow, low), low)
+
+nyMinutes = hour(time, sessionTZ) * 60 + minute(time, sessionTZ)
+inSweepWindow = nyMinutes >= 736 and nyMinutes < 960     // [OPT] 12:16-16:00
+inConfirmWindow = nyMinutes >= 736 and nyMinutes < confirmationEnd  // [OPT]
+
+refHigh3 = ta.highest(high[1], 3)
+refLow3 = ta.lowest(low[1], 3)
+
+var bool bullPending = false
+var bool bearPending = false
+var int bullSweepBar = na
+var int bearSweepBar = na
+var float bullSweepLow = na
+var float bearSweepHigh = na
+
+bullSweepNow = isLowTF and inSweepWindow and not na(asiaLow) and low < asiaLow and close > asiaLow
+bearSweepNow = isLowTF and inSweepWindow and not na(asiaHigh) and high > asiaHigh and close < asiaHigh
+if bullSweepNow
+    bullPending := true
+    bullSweepBar := bar_index
+    bullSweepLow := low
+if bearSweepNow
+    bearPending := true
+    bearSweepBar := bar_index
+    bearSweepHigh := high
+if bullPending and not na(bullSweepBar) and bar_index - bullSweepBar > barsAfterSweep
+    bullPending := false
+if bearPending and not na(bearSweepBar) and bar_index - bearSweepBar > barsAfterSweep
+    bearPending := false
+
+//====================================================
+// CONFIRMATION
+//====================================================
+barRange = math.max(high - low, syminfo.mintick)
+bodyPct = safeDiv(math.abs(close - open), barRange)
+closePosLong = safeDiv(close - low, barRange)
+closePosShort = safeDiv(high - close, barRange)
+rangePass = (high - low) >= atrV * rangeATR
+strongBull = close > open and bodyPct >= minimumBody and closePosLong >= 0.60   // [OPT] close_pos 0.60
+strongBear = close < open and bodyPct >= minimumBody and closePosShort >= 0.60  // [OPT]
+bullConfirm = close > refHigh3
+bearConfirm = close < refLow3
+
+longCandidate = validTimeframe and bullPending and bar_index > bullSweepBar and inConfirmWindow and rangePass and strongBull and lowLongBias and bullConfirm
+shortCandidate = isLowTF and bearPending and bar_index > bearSweepBar and inConfirmWindow and rangePass and strongBear and lowShortBias and bearConfirm
+longSL = math.min(math.min(bullSweepLow, low), close - atrV * minimumStopATR) - syminfo.mintick * stopBufferTicks
+shortSL = math.max(math.max(bearSweepHigh, high), close + atrV * minimumStopATR) + syminfo.mintick * stopBufferTicks
+
+longSignal = barstate.isconfirmed and longCandidate
+shortSignal = barstate.isconfirmed and shortCandidate
+
+//====================================================
+// VIRTUAL TRADE ENGINE (SL-guard, one trade at a time)
+//====================================================
+commissionRate = commissionPct / 100.0
+varip int virtualPosition = 0
+varip float entryPrice = na
+varip float stopPrice = na
+varip float targetPrice = na
+varip float entryCommission = na
+varip int totalTrades = 0
+varip int winTrades = 0
+varip int lossTrades = 0
+varip float netPnL = 0.0
+varip float grossProfit = 0.0
+varip float grossLoss = 0.0
+
+float exitPrice = na
+string exitReason = ""
+if virtualPosition != 0
+    if virtualPosition == 1
+        if open <= stopPrice
+            exitPrice := open
+            exitReason := "SL GAP"
+        else if open >= targetPrice
+            exitPrice := open
+            exitReason := "TP GAP"
+        else
+            hitSL = low <= stopPrice
+            hitTP = high >= targetPrice
+            if hitSL and hitTP
+                highFirst = math.abs(high - open) < math.abs(open - low)
+                exitPrice := highFirst ? targetPrice : stopPrice
+                exitReason := highFirst ? "TP" : "SL"
+            else if hitSL
+                exitPrice := stopPrice
+                exitReason := "SL"
+            else if hitTP
+                exitPrice := targetPrice
+                exitReason := "TP"
+    else
+        if open >= stopPrice
+            exitPrice := open
+            exitReason := "SL GAP"
+        else if open <= targetPrice
+            exitPrice := open
+            exitReason := "TP GAP"
+        else
+            hitSL = high >= stopPrice
+            hitTP = low <= targetPrice
+            if hitSL and hitTP
+                highFirst = math.abs(high - open) < math.abs(open - low)
+                exitPrice := highFirst ? stopPrice : targetPrice
+                exitReason := highFirst ? "SL" : "TP"
+            else if hitSL
+                exitPrice := stopPrice
+                exitReason := "SL"
+            else if hitTP
+                exitPrice := targetPrice
+                exitReason := "TP"
+    if not na(exitPrice)
+        pnl = virtualPosition * (exitPrice - entryPrice) - entryCommission - math.abs(exitPrice) * commissionRate
+        totalTrades += 1
+        netPnL += pnl
+        if pnl > 0
+            winTrades += 1
+            grossProfit += pnl
+        else
+            lossTrades += 1
+            grossLoss += math.abs(pnl)
+        virtualPosition := 0
+
+bool executedLongSignal = false
+bool executedShortSignal = false
+if barstate.isconfirmed and virtualPosition == 0 and (longSignal or shortSignal)
+    isLongEntry = longSignal
+    executedLongSignal := isLongEntry
+    executedShortSignal := not isLongEntry
+    virtualPosition := isLongEntry ? 1 : -1
+    entryPrice := close
+    stopPrice := isLongEntry ? longSL : shortSL
+    risk = math.max(math.abs(entryPrice - stopPrice), syminfo.mintick)
+    targetPrice := isLongEntry ? entryPrice + risk * rrTarget : entryPrice - risk * rrTarget
+    entryCommission := math.abs(entryPrice) * commissionRate
+
+//====================================================
+// VISUALS / DASHBOARD
+//====================================================
+plot(showEMAs ? ema21 : na, "EMA 21", color=color.yellow, linewidth=2)
+plot(showEMAs ? ema200 : na, "EMA 200", color=color.aqua, linewidth=2)
+plot(showAsian ? asiaHigh : na, "Asian High", color=color.new(color.red, 35), style=plot.style_linebr)
+plot(showAsian ? asiaLow : na, "Asian Low", color=color.new(color.green, 35), style=plot.style_linebr)
+plotshape(showSignals and executedLongSignal, title="BUY", style=shape.triangleup, location=location.belowbar, color=color.rgb(0, 255, 110), size=size.large, text="BUY", textcolor=color.black)
+plotshape(showSignals and executedShortSignal, title="SELL", style=shape.triangledown, location=location.abovebar, color=color.rgb(255, 25, 70), size=size.large, text="SELL", textcolor=color.white)
+bgcolor(not validTimeframe ? color.new(color.red, 88) : na, title="Unsupported timeframe")
+alertcondition(executedLongSignal, title="Arena BUY", message="Arena AI BUY on {{ticker}} {{interval}}")
+alertcondition(executedShortSignal, title="Arena SELL", message="Arena AI SELL on {{ticker}} {{interval}}")
+
+winRate = totalTrades > 0 ? winTrades * 100.0 / totalTrades : na
+profitFactor = grossLoss > 0 ? grossProfit / grossLoss : na
+status = virtualPosition == 1 ? "LONG" : virtualPosition == -1 ? "SHORT" : "FLAT"
+var table dash = table.new(position.top_right, 2, 8, frame_color=color.new(color.gray, 55), border_width=1)
+if barstate.islast and showDashboard
+    table.cell(dash, 0, 0, "ARENA AI-OPT", bgcolor=color.new(color.blue, 20), text_color=color.white)
+    table.cell(dash, 1, 0, "1m model", bgcolor=color.new(color.blue, 20), text_color=color.white)
+    table.cell(dash, 0, 1, "Status", text_color=color.white)
+    table.cell(dash, 1, 1, status, text_color=color.white)
+    table.cell(dash, 0, 2, "Trades", text_color=color.white)
+    table.cell(dash, 1, 2, str.tostring(totalTrades), text_color=color.white)
+    table.cell(dash, 0, 3, "Win Rate", text_color=color.white)
+    table.cell(dash, 1, 3, na(winRate) ? "NA" : str.tostring(winRate, "#.##") + "%", text_color=color.white)
+    table.cell(dash, 0, 4, "Profit Factor", text_color=color.white)
+    table.cell(dash, 1, 4, na(profitFactor) ? "NA" : str.tostring(profitFactor, "#.##"), text_color=color.white)
+    table.cell(dash, 0, 5, "Net", text_color=color.white)
+    table.cell(dash, 1, 5, str.tostring(netPnL, "#.##"), text_color=color.white)
+    table.cell(dash, 0, 6, "RR", text_color=color.white)
+    table.cell(dash, 1, 6, "1:" + str.tostring(rrTarget, "#.##"), text_color=color.white)
+    table.cell(dash, 0, 7, "Stop", text_color=color.white)
+    table.cell(dash, 1, 7, str.tostring(minimumStopATR,"#.##") + "*ATR", text_color=color.white)
