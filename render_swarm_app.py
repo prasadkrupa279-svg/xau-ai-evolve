@@ -31,17 +31,17 @@ MEM = "memory/tf_agents.json"
 
 # VERIFIED TradingView baseline (per TF) -> agents target to BEAT these
 BASELINE = {
-    "1m":  {"rr": "1:3",   "trades": 96,  "wr": 41.67, "pf": 2.00, "net": 513},
-    "3m":  {"rr": "1:3",   "trades": 105, "wr": 36.19, "pf": 1.29, "net": 155},
-    "5m":  {"rr": "1:3",   "trades": 50,  "wr": 48.00, "pf": 2.44, "net": 474},
-    "15m": {"rr": "1:2.5", "trades": 196, "wr": 39.29, "pf": 1.71, "net": 947},
-    "30m": {"rr": "1:2",   "trades": 601, "wr": 38.94, "pf": 1.11, "net": 529},
-    "45m": {"rr": "1:2",   "trades": 495, "wr": 40.81, "pf": 1.28, "net": 1001},
-    "1H":  {"rr": "1:2",   "trades": 364, "wr": 46.15, "pf": 1.54, "net": 1853},
-    "2H":  {"rr": "1:2",   "trades": 272, "wr": 42.28, "pf": 1.40, "net": 1189},
-    "3H":  {"rr": "1:2",   "trades": 241, "wr": 44.81, "pf": 1.38, "net": 1118},
-    "4H":  {"rr": "1:2",   "trades": 216, "wr": 43.52, "pf": 1.56, "net": 1513},
-    "1D":  {"rr": "1:1",   "trades": 198, "wr": 58.08, "pf": 1.26, "net": 1073},
+    "1m":  {"rr": "1:3",   "trades": 196,  "wr": 36.0, "pf": 2.61, "net": 1771},
+    "3m":  {"rr": "1:3",   "trades": 598,  "wr": 31.0, "pf": 1.48, "net": 1819},
+    "5m":  {"rr": "1:3",   "trades": 356,  "wr": 36.0, "pf": 1.75, "net": 2526},
+    "15m": {"rr": "1:2.5", "trades": 91,   "wr": 52.0, "pf": 2.79, "net": 2198},
+    "30m": {"rr": "1:2",   "trades": 45,   "wr": 64.0, "pf": 3.73, "net": 2532},
+    "45m": {"rr": "1:2",   "trades": 39,   "wr": 69.0, "pf": 4.79, "net": 2365},
+    "1H":  {"rr": "1:2",   "trades": 44,   "wr": 59.0, "pf": 3.39, "net": 2515},
+    "2H":  {"rr": "1:2",   "trades": 55,   "wr": 60.0, "pf": 4.69, "net": 3295},
+    "3H":  {"rr": "1:2",   "trades": 74,   "wr": 54.0, "pf": 2.72, "net": 2089},
+    "4H":  {"rr": "1:2",   "trades": 54,   "wr": 69.0, "pf": 3.76, "net": 3188},
+    "1D":  {"rr": "1:1",   "trades": 0,    "wr": 0.0,  "pf": 0.0,  "net": 0},
 }
 
 app = Flask(__name__)
@@ -59,16 +59,14 @@ def resample(df, rule):
 
 
 def score(s):
-    """Q-ENG multi-objective: force trades + winrate + PF ALL up together.
-    - kill tiny-sample overfit (needs >= 10 trades)
-    - PF capped at 4 so it can't win via 1-trade 50-PF flukes
-    - trades rewarded up to ~80+ (more volume = better)"""
+    """Q-ENG trades-dominated: push trade VOLUME hard (user wants 300+/TF).
+    More trades rewarded strongly; WR/PF kept mild so quality doesn't fully collapse."""
     pf = max(s.get("pf", 0), 0); wr = s.get("winrate", 0); tr = s.get("trades", 0)
-    if tr < 10:
+    if tr < 20:
         return 0.0
-    f_wr = wr ** 0.8                       # winrate up
-    f_pf = min(pf, 4.0)                    # PF up (capped)
-    f_tr = min(1.0, tr / 80.0) * (1 + 0.15 * math.log1p(tr))   # trades up
+    f_wr = wr ** 0.5                       # keep some winrate
+    f_pf = min(pf, 3.0) ** 0.7             # keep some PF
+    f_tr = min(2.0, tr / 120.0) * (1 + 0.25 * math.log1p(tr))   # trades DOMINATE (up to ~150+)
     return f_wr * f_pf * f_tr
 
 
@@ -140,6 +138,13 @@ def swarm_main():
                 continue
             pre = get_precomp(rdf); del rdf
             st = TFState(tf, rr, pre); states[tf] = st
+            # seed HIGH-TRADE (loose-filter) genomes so the swarm starts with VOLUME, not 1-trade flukes
+            base = UnifiedGenome()
+            base.ind_conf = 1; base.range_atr = 0.3; base.min_body = 0.2; base.close_pos_min = 0.5
+            base.use_daily = False; base.use_h1 = False; base.use_h4 = False
+            base.bars_after_sweep = 200; base.cooldown = 0; base.rr_target = rr
+            _sr = random.Random(7)
+            st.elites = [base, mutate_unified(base, 0.4, _sr), mutate_unified(base, 0.4, _sr), mutate_unified(base, 0.4, _sr)]
             for w in range(AGENTS_PER_TF):
                 threading.Thread(target=worker, args=(st, random.Random(1000 + w * 7 + ord(tf[0]) % 97)),
                                  daemon=True).start()
