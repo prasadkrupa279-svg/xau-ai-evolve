@@ -1,0 +1,102 @@
+//@version=5
+// =============================================================================
+//  XAUUSD AI Consensus — TradingView Pine v5
+//  Mirrors the Python 37-vote consensus used by the evolution engine.
+//  Each of 37 sources casts +1 (bull) / -1 (bear) / 0 (neutral); the sum is the
+//  net consensus. Pairs with the dashboard's "Consensus" card.
+//  (Indicator maths approximated for Pine; aligns direction, not bit-exact.)
+// =============================================================================
+indicator("XAUUSD AI Consensus (37 votes)", shorttitle="AI37", overlay=false)
+
+src = close
+consensus = 0.0
+
+// --- RSI 5/9/14/21/30 ---
+rsi_(p) => ta.rsi(src, p)
+consensus += ta.change(ta.ema(src, 5))  // placeholders kept lightweight below
+// RSI family
+f_rsi(p) => v = ta.rsi(src, p)
+for p in array.from(5,9,14,21,30)
+    consensus += nz(math.sign(ta.rsi(src,p)-50))
+
+// --- Stoch 9/14/21 (K>D) ---
+f_stoch(p) =>
+    k = ta.sma(ta.stoch(src,high,low,p),3)
+    d = ta.sma(k,3)
+for p in array.from(9,14,21)
+    consensus += nz(math.sign(ta.stoch(src,high,low,p)-ta.sma(ta.stoch(src,high,low,p),3)))
+
+// --- Williams %R 9/14/21 (>-50 bull) ---
+for p in array.from(9,14,21)
+    wr = -100*(ta.highest(high,p)-src)/(ta.highest(high,p)-ta.lowest(low,p))
+    consensus += nz(math.sign(wr+50))
+
+// --- MFI 14/21/30 (>50 bull) ---
+for p in array.from(14,21,30)
+    mfi = ta.mfi(hlc3,p)
+    consensus += nz(math.sign(mfi-50))
+
+// --- CMF 20/30 (>0 bull) ---
+for p in array.from(20,30)
+    mfm = hlc3==hlc3[1]?0:((close-low)-(high-close))/(high-low==0?1:high-low)
+    consensus += nz(math.sign(ta.sum(mfm*volume,p)/ta.sum(volume,p)))
+
+// --- Force 13/21/34 (>0 bull) ---
+for p in array.from(13,21,34)
+    consensus += nz(math.sign(ta.ema(ta.change(src)*volume,p)))
+
+// --- OBV slope 10/20 ---
+obv = ta.cum(ta.change(src)>0?volume:ta.change(src)<0?-volume:0)
+for p in array.from(10,20)
+    consensus += nz(math.sign(obv-obv[p]))
+
+// --- VWAP deviation 20/30 ---
+for p in array.from(20,30)
+    vw = ta.sum(hlc3*volume,p)/ta.sum(volume,p)
+    consensus += nz(math.sign((src-vw)/src*100))
+
+// --- Aroon 14/25 (Up>Down) ---
+for p in array.from(14,25)
+    up = 100*(p-ta.highestbars(high,p+1))/p
+    dn = 100*(p-ta.lowestbars(low,p+1))/p
+    consensus += nz(math.sign(up-dn))
+
+// --- TSI 13/21/30 (>0 bull) ---
+for p in array.from(13,21,30)
+    m = ta.change(src)
+    tsi = 100*ta.ema(ta.ema(m,p),p*2)/ta.ema(ta.ema(math.abs(m),p),p*2)
+    consensus += nz(math.sign(tsi))
+
+// --- Ultimate 28 (>50) ---
+bp = close - math.min(low,close[1])
+tr7 = math.max(high-low,math.abs(high-close[1]),math.abs(low-close[1]))
+uo = 100*(4*ta.sma(bp,7)/ta.sma(tr7,7)+2*ta.sma(bp,14)/ta.sma(tr7,14)+ta.sma(bp,28)/ta.sma(tr7,28))/7
+consensus += nz(math.sign(uo-50))
+
+// --- BOP ---
+bop = (close-open)/((high-low)==0?1:high-low)
+consensus += nz(math.sign(bop))
+
+// --- Vortex 14/21 ---
+for p in array.from(14,21)
+    tr = math.max(math.abs(high-low),math.abs(high-close[1]),math.abs(low-close[1]))
+    vip = ta.sum(math.abs(high-low[1]),p)/ta.sum(tr,p)
+    vim = ta.sum(math.abs(low-high[1]),p)/ta.sum(tr,p)
+    consensus += nz(math.sign(vip-vim))
+
+// --- ZLEMA 21/30/50 (price>zlema) ---
+for p in array.from(21,30,50)
+    lag = src[p/2]
+    z = ta.ema(2*src-lag,p)
+    consensus += nz(math.sign((src-z)/src*100))
+
+// --- Elder Ray 13/21 ---
+for p in array.from(13,21)
+    e = ta.ema(src,p)
+    consensus += nz(math.sign((high-e)+(low-e)))
+
+plot(consensus, title="Net consensus", color=consensus>0?color.new(#22c55e,0):consensus<0?color.new(#f87171,0):color.new(#8ea0c8,0), linewidth=2)
+hline(0, "flat", color=color.gray)
+plot(consensus, style=plot.style_columns, title="bars", color=consensus>0?color.new(#22c55e,80):consensus<0?color.new(#f87171,80):na)
+alertcondition(consensus>5, "Strong BUY consensus", "AI consensus BUY")
+alertcondition(consensus<-5, "Strong SELL consensus", "AI consensus SELL")
