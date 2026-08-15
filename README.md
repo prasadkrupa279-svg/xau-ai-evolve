@@ -9,6 +9,11 @@ Telegram alerts.
 > ~16–34% winrate mathematically honest. **75%+ winrate at 1:5 is impossible** and is
 > never claimed. LIVE trading is **hard-blocked** — demo/paper only.
 
+## 🔗 Live
+- **Dashboard (24/7 evolving):** https://xau-ai-evolve.onrender.com
+- **Source:** https://github.com/prasadkrupa279-svg/xau-ai-evolve
+- **Render:** https://dashboard.render.com/web/srv-da058as9v7es738kcan0
+
 ---
 
 ## 📦 Deliverables
