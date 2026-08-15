@@ -20,6 +20,7 @@ import pandas as pd
 
 from genome import Genome, random_genome, crossover, mutate, fitness, RR_DEFAULT, SL_CHOICES
 from ppa_engine import run_backtest
+from util import safe_read_json, safe_write_json
 
 POP_SIZE = 50
 ELITE = 8
@@ -168,43 +169,36 @@ class EvolutionEngine:
             "champion": {**champ["stats"], "key": champ["key"], "genome": champ["genome"]},
             "leaderboard": leaderboard,
         }
-        tmp = self.memory_path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp, self.memory_path)
+        safe_write_json(self.memory_path, data)
 
     # ----------------------------------------------------------- consensus signal
     def consensus_signal(self) -> dict:
-        """Top-K agents vote on the LAST closed bar -> net direction."""
-        if not os.path.exists(self.memory_path):
-            return {"signal": "flat", "agreement": 0.0, "votes": 0}
-        with open(self.memory_path) as f:
-            mem = json.load(f)
-        top = mem.get("leaderboard", [])[:TOP_K_CONSENSUS]
-        if not top:
-            return {"signal": "flat", "agreement": 0.0, "votes": 0}
-        last_votes = self.votes[-1]
-        tally = 0
-        for a in top:
-            g = Genome(**a["genome"])
-            m = g.mask_array()
-            tally += int((last_votes * m).sum())
-        if tally > 0:
-            sig = "buy"
-        elif tally < 0:
-            sig = "sell"
-        else:
-            sig = "flat"
-        agree = abs(tally) / max(1, sum(a["genome"]["enabled"].bit_count() for a in top))
-        return {"signal": sig, "score": int(tally), "agreement": round(min(1.0, agree), 3),
-                "voters": len(top)}
+        """Top-K agents vote on the LAST closed bar -> net direction. Never raises."""
+        try:
+            mem = safe_read_json(self.memory_path)
+            if not mem:
+                return {"signal": "flat", "agreement": 0.0, "votes": 0, "score": 0, "voters": 0}
+            top = (mem.get("leaderboard") or [])[:TOP_K_CONSENSUS]
+            if not top:
+                return {"signal": "flat", "agreement": 0.0, "votes": 0, "score": 0, "voters": 0}
+            last_votes = self.votes[-1]
+            tally = 0
+            for a in top:
+                g = Genome(**a["genome"])
+                m = g.mask_array()
+                tally += int((last_votes * m).sum())
+            sig = "buy" if tally > 0 else ("sell" if tally < 0 else "flat")
+            agree = abs(tally) / max(1, sum(a["genome"].get("enabled", 0).bit_count() for a in top))
+            return {"signal": sig, "score": int(tally),
+                    "agreement": round(min(1.0, agree), 3), "voters": len(top)}
+        except Exception as e:
+            print(f"[evolution] consensus error: {e}", flush=True)
+            return {"signal": "flat", "agreement": 0.0, "votes": 0, "score": 0, "voters": 0}
 
     # ----------------------------------------------------------- leaderboard accessor
     def leaderboard(self) -> list[dict]:
-        if not os.path.exists(self.memory_path):
-            return []
-        with open(self.memory_path) as f:
-            return json.load(f).get("leaderboard", [])
+        mem = safe_read_json(self.memory_path)
+        return (mem or {}).get("leaderboard", []) if mem else []
 
 
 if __name__ == "__main__":

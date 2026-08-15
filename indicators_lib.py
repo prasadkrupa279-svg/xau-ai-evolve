@@ -100,11 +100,21 @@ def _build_values(df: pd.DataFrame) -> dict[str, np.ndarray]:
         vwap = (tp * vol).rolling(p, min_periods=1).sum() / vol.rolling(p, min_periods=1).sum()
         vals[f"vwap{p}"] = ((c - vwap) / c * 100).fillna(0.0).to_numpy()
 
-    # --- Aroon (14,25) -> Up>Down bull
+    # --- Aroon (14,25) -> Up>Down bull  (VECTORISED: no per-window Python call)
+    from numpy.lib.stride_tricks import sliding_window_view as _swv
+    _carr = c.to_numpy(dtype=float)
+    _n = len(_carr)
     for p in (14, 25):
-        up = c.rolling(p + 1, min_periods=1).apply(lambda w: 100.0 * (np.argmax(w)) / max(1, len(w) - 1), raw=True)
-        dn = c.rolling(p + 1, min_periods=1).apply(lambda w: 100.0 * (np.argmin(w)) / max(1, len(w) - 1), raw=True)
-        vals[f"aroon{p}"] = (up - dn).fillna(0.0).to_numpy()
+        if _n > p:
+            _sw = _swv(_carr, p + 1)             # (n-p, p+1) windows, oldest..newest
+            up_idx = _sw.argmax(axis=1)          # position of high (0=oldest .. p=newest)
+            dn_idx = _sw.argmin(axis=1)
+            up = np.zeros(_n); dn = np.zeros(_n)
+            up[p:] = up_idx / p * 100.0
+            dn[p:] = dn_idx / p * 100.0
+        else:
+            up = np.zeros(_n); dn = np.zeros(_n)
+        vals[f"aroon{p}"] = (up - dn)
 
     # --- TSI (13,21,30) -> >0 bull  (r,s smoothing)
     m = c.diff()

@@ -33,44 +33,99 @@ app = Flask(__name__)
 RT = {
     "ready": False, "warming": "loading data...", "df_bars": 0, "data_source": None,
     "engine": None, "tracker": None, "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+    "epoch": 0, "last_update": 0.0, "restarts": 0, "error": None, "boot_error": None,
 }
 _last = {"gen": 0, "best_fit": 0.0, "mut_rate": 0.0, "stagnant": 0, "champion": None, "ts": None}
 
 
 def _evolution_loop(df, votes):
-    eng = EvolutionEngine(df, votes, memory_path=MEMORY_PATH)
+    my_epoch = RT["epoch"]
+    try:
+        eng = EvolutionEngine(df, votes, memory_path=MEMORY_PATH)
+    except Exception as e:
+        RT["warming"] = f"FATAL (engine init): {e}"
+        print(f"[dashboard] engine init fatal: {e}\n{traceback.format_exc()}", flush=True)
+        return
     RT["engine"] = eng
     RT["ready"] = True
     RT["warming"] = None
-    print(f"[dashboard] evolution ready. data={RT['data_source']} bars={len(df):,}", flush=True)
-    if ENABLE_PAPER:
-        RT["tracker"] = PaperTracker("memory/paper_results.json")
-        start_alerter(eng.consensus_signal, RT["tracker"], feed=build_feed(float(df["close"].iloc[-1])))
-        print("[dashboard] paper trading ENABLED.", flush=True)
+    RT["last_update"] = time.time()
+    print(f"[dashboard] evolution ready. data={RT.get('data_source')} bars={len(df):,}", flush=True)
+    if ENABLE_PAPER and not RT.get("tracker"):
+        try:
+            RT["tracker"] = PaperTracker("memory/paper_results.json")
+            start_alerter(eng.consensus_signal, RT["tracker"],
+                          feed=build_feed(float(df["close"].iloc[-1])))
+            print("[dashboard] paper trading ENABLED.", flush=True)
+        except Exception as e:
+            print(f"[dashboard] paper setup error (ignored): {e}", flush=True)
+
+    consec = 0
     while True:
+        if RT["epoch"] != my_epoch:          # a reset happened -> exit cleanly
+            print(f"[dashboard] epoch changed ({my_epoch}->{RT['epoch']}), stopping old loop.", flush=True)
+            return
         try:
             r = eng.step()
+            consec = 0
             _last.update(gen=r["gen"], best_fit=r["best_fit"], mut_rate=r["mut_rate"],
                          stagnant=r["stagnant"], champion=r["champion"],
                          ts=time.strftime("%Y-%m-%d %H:%M:%S"))
+            RT["last_update"] = time.time()
+            RT["error"] = None
         except Exception as e:
-            print(f"[dashboard] gen error: {e}\n{traceback.format_exc()}", flush=True)
-            time.sleep(5)
+            consec += 1
+            RT["error"] = f"gen error #{consec}: {e}"
+            print(f"[dashboard] gen error #{consec}: {e}\n{traceback.format_exc()}", flush=True)
+            time.sleep(min(30, 2 ** consec))
+            if consec and consec % 15 == 0:
+                try:
+                    eng._init_population()
+                except Exception:
+                    pass
         time.sleep(GEN_SLEEP)
 
 
-def _init():
-    def worker():
-        try:
+def _boot_and_evolve():
+    """Load data + compute votes ONCE (cached), then run evolution forever."""
+    try:
+        if RT.get("df") is not None and RT.get("votes") is not None:
+            df, votes = RT["df"], RT["votes"]
+        else:
             df, src = ensure_data(DATA_DIR)
-            RT["df_bars"] = len(df); RT["data_source"] = src
+            RT["df"] = df; RT["df_bars"] = len(df); RT["data_source"] = src
             RT["warming"] = f"computing 37 indicators on {len(df):,} bars..."
             votes, _ = compute_votes(df)
-            _evolution_loop(df, votes)
+            RT["votes"] = votes
+        _evolution_loop(df, votes)
+    except Exception as e:
+        RT["warming"] = f"FATAL: {e}"
+        RT["boot_error"] = str(e)
+        print(f"[dashboard] boot fatal: {e}\n{traceback.format_exc()}", flush=True)
+
+
+def _start_evolution_thread():
+    t = threading.Thread(target=_boot_and_evolve, daemon=True, name="evolution")
+    RT["ev_thread"] = t
+    t.start()
+    return t
+
+
+def _watchdog():
+    """Self-heal: if the evolution thread dies, restart it (rate-limited)."""
+    while True:
+        time.sleep(60)
+        try:
+            t = RT.get("ev_thread")
+            if not (t and t.is_alive()):
+                RT["restarts"] = RT.get("restarts", 0) + 1
+                print(f"[watchdog] evolution thread dead -> restart #{RT['restarts']}", flush=True)
+                RT["ready"] = False
+                if not RT.get("warming"):
+                    RT["warming"] = "restarting evolution (self-heal)..."
+                _start_evolution_thread()
         except Exception as e:
-            RT["warming"] = f"FATAL: {e}"
-            print(f"[dashboard] init fatal: {e}\n{traceback.format_exc()}", flush=True)
-    threading.Thread(target=worker, daemon=True, name="evolution").start()
+            print(f"[watchdog] error: {e}", flush=True)
 
 
 def _keepalive():
@@ -96,25 +151,57 @@ def health():
 
 @app.route("/api/state")
 def state():
-    eng = RT["engine"]
-    payload = {
-        "ready": RT["ready"],
-        "warming": RT["warming"],
-        "started": RT["started"],
-        "data_source": RT["data_source"],
-        "bars": RT["df_bars"],
-        "gen": _last["gen"],
-        "best_fit": _last["best_fit"],
-        "mut_rate": _last["mut_rate"],
-        "stagnant": _last["stagnant"],
-        "champion": _last["champion"],
-        "leaderboard": (eng.leaderboard() if eng else []),
-        "consensus": (eng.consensus_signal() if eng else {"signal": "flat"}),
-        "paper": (RT["tracker"].stats() if RT["tracker"] else None),
-        "updated": _last["ts"],
-        "ts_now": time.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    return jsonify(payload)
+    try:
+        eng = RT["engine"]
+        payload = {
+            "ready": RT["ready"],
+            "warming": RT["warming"],
+            "started": RT["started"],
+            "data_source": RT["data_source"],
+            "bars": RT["df_bars"],
+            "gen": _last["gen"],
+            "best_fit": _last["best_fit"],
+            "mut_rate": _last["mut_rate"],
+            "stagnant": _last["stagnant"],
+            "champion": _last["champion"],
+            "leaderboard": (eng.leaderboard() if eng else []),
+            "consensus": (eng.consensus_signal() if eng else {"signal": "flat"}),
+            "paper": (RT["tracker"].stats() if RT["tracker"] else None),
+            "updated": _last["ts"],
+            "ts_now": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "restarts": RT.get("restarts", 0),
+            "error": RT.get("error") or RT.get("boot_error"),
+        }
+        return jsonify(payload)
+    except Exception as e:
+        # NEVER return a 500 to the dashboard client
+        return jsonify({
+            "ready": RT.get("ready"), "error": f"state error: {e}",
+            "leaderboard": [], "consensus": {"signal": "flat"},
+            "gen": _last.get("gen", 0), "data_source": RT.get("data_source"),
+            "bars": RT.get("df_bars"), "champion": None,
+        })
+
+
+@app.route("/api/reset", methods=["POST", "GET"])
+def reset():
+    """Wipe ALL agents/strategies and restart evolution from empty (self-heal)."""
+    try:
+        RT["epoch"] += 1                    # old loop exits on its own
+        for p in (MEMORY_PATH, "memory/paper_results.json"):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+        _last.update(gen=0, best_fit=0.0, mut_rate=0.0, stagnant=0, champion=None, ts=None)
+        RT["ready"] = False
+        RT["error"] = None
+        RT["warming"] = "reset: wiping agents, restarting evolution from empty..."
+        RT["tracker"] = None
+        _start_evolution_thread()
+        return jsonify({"ok": True, "msg": "agents wiped; evolution restarting fresh"})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
 
 
 @app.route("/")
@@ -215,7 +302,8 @@ async function tick(){
 tick(); setInterval(tick,4000);
 </script></body></html>"""
 
-_init()
+_start_evolution_thread()
+threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
 _keepalive()
 
 if __name__ == "__main__":

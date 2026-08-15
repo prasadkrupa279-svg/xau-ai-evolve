@@ -83,6 +83,16 @@ def _fvg_zones(low: np.ndarray, high: np.ndarray):
 def run_backtest(df: pd.DataFrame, votes: np.ndarray, g: Genome,
                  lot: float = 1.0, spread: float | None = None,
                  max_hold: int = MAX_HOLD) -> dict:
+    try:
+        return _run_backtest_inner(df, votes, g, lot, spread, max_hold)
+    except Exception as e:                      # NEVER crash the daemon on one genome
+        print(f"[ppa_engine] backtest error (genome {getattr(g,'key',lambda:'?')()}): {e}", flush=True)
+        return _empty_stats()
+
+
+def _run_backtest_inner(df: pd.DataFrame, votes: np.ndarray, g: Genome,
+                        lot: float = 1.0, spread: float | None = None,
+                        max_hold: int = MAX_HOLD) -> dict:
     o = df["open"].to_numpy(float); h = df["high"].to_numpy(float)
     l = df["low"].to_numpy(float); c = df["close"].to_numpy(float)
     n = len(df)

@@ -50,8 +50,27 @@ def run_daemon(generations: int | None = None, data_dir: str = DATA_DIR,
         eng = EvolutionEngine(df, votes, memory_path=memory_path)
 
         g = 0
+        consecutive_err = 0
         while generations is None or g < generations:
-            r = eng.step()
+            try:
+                r = eng.step()
+                consecutive_err = 0
+                with _lock:
+                    STATE["error"] = None
+            except Exception as e:
+                consecutive_err += 1
+                with _lock:
+                    STATE["error"] = f"gen error #{consecutive_err}: {e}"
+                log(f"gen error #{consecutive_err}: {e}\n{traceback.format_exc()}")
+                # back off, then keep going (never give up). Re-init population if it got wiped.
+                time.sleep(min(30, 2 ** consecutive_err))
+                if consecutive_err % 20 == 0:
+                    log("too many errors -> re-initialising population")
+                    try:
+                        eng._init_population()
+                    except Exception:
+                        pass
+                continue
             c = r["champion"]
             with _lock:
                 STATE["gen"] = r["gen"]

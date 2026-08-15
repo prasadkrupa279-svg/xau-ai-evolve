@@ -30,11 +30,11 @@ class PaperTracker:
                 self.open_trades, self.closed = [], []
 
     def _save(self):
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        tmp = self.path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"open": self.open_trades, "closed": self.closed[-500:]}, f)
-        os.replace(tmp, self.path)
+        try:
+            from util import safe_write_json
+            safe_write_json(self.path, {"open": self.open_trades, "closed": self.closed[-500:]})
+        except Exception:
+            pass
 
     def open_trade(self, side: int, price: float, sl: float, tp: float,
                    lot: float = 0.01, symbol: str = "XAUUSD") -> dict:
