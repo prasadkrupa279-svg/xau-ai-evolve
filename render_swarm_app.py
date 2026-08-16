@@ -22,11 +22,10 @@ from strategy_unified import (get_precomp, run_backtest, UnifiedGenome,
                               random_unified, crossover_unified, mutate_unified)
 from util import safe_write_json, safe_read_json
 
-TFS = [("1m", "1min", 3.0), ("3m", "3min", 3.0), ("5m", "5min", 3.0), ("15m", "15min", 2.5),
-       ("30m", "30min", 2.0), ("45m", "45min", 2.0), ("1H", "1h", 2.0), ("2H", "2h", 2.0),
-       ("3H", "3h", 2.0), ("4H", "4h", 2.0), ("1D", "1D", 1.0)]   # ALL 11 TFs, none excluded
-AGENTS_PER_TF = int(os.environ.get("AGENTS_PER_TF", "15"))   # 6*15 = 90 agents
-MAX_BARS = int(os.environ.get("MAX_BARS", "250000"))         # cap bars/TF -> fits 512MB
+TFS = [("1m", "1min", 3.0, "Alpha"), ("3m", "3min", 3.0, "Beta"), ("5m", "5min", 3.0, "Gamma"),
+       ("15m", "15min", 2.5, "Delta")]   # ONLY 4 TFs: 1m/3m/5m/15m (focus)
+AGENTS_PER_TF = int(os.environ.get("AGENTS_PER_TF", "5"))    # 4 TFs * 5 = 20 agents (more per TF)
+MAX_BARS = int(os.environ.get("MAX_BARS", "0"))              # FULL data (float32 + 4 TFs fits 512MB)
 MEM = "memory/tf_agents.json"
 
 # VERIFIED TradingView baseline (per TF) -> agents target to BEAT these
@@ -59,10 +58,9 @@ def resample(df, rule):
 
 
 def score(s):
-    """Q-ENG trades-dominated: push trade VOLUME hard (user wants 300+/TF).
-    More trades rewarded strongly; WR/PF kept mild so quality doesn't fully collapse."""
+    """Q-ENG: trades + WR + PF. NO LOSSES accepted (net<0 = 0)."""
     pf = max(s.get("pf", 0), 0); wr = s.get("winrate", 0); tr = s.get("trades", 0)
-    if tr < 20:
+    if tr < 20 or s.get("net_profit", 0) < 0:
         return 0.0
     f_wr = wr ** 0.5                       # keep some winrate
     f_pf = min(pf, 3.0) ** 0.7             # keep some PF
@@ -71,8 +69,8 @@ def score(s):
 
 
 class TFState:
-    def __init__(self, tf, rr, pre):
-        self.tf, self.rr, self.pre = tf, rr, pre
+    def __init__(self, tf, rr, pre, name):
+        self.tf, self.rr, self.pre, self.name = tf, rr, pre, name
         self.seen = set(); self.elites = []; self.best = None
         self.evals = 0; self.dups = 0; self.lock = threading.Lock()
 
@@ -87,7 +85,7 @@ class TFState:
         with self.lock:
             self.evals += 1
             if self.best is None or sc >= self.best["score"]:
-                self.best = {"name": f"Agent-{self.tf}", "tf": self.tf, "rr": self.rr,
+                self.best = {"name": self.name + "-" + self.tf, "tf": self.tf, "rr": self.rr,
                              "trades": s["trades"], "winrate": s["winrate"], "pf": s["pf"],
                              "net_profit": s["net_profit"], "score": round(sc, 4),
                              "evals": self.evals, "dups": self.dups, "params": asdict(g),
@@ -130,14 +128,14 @@ def swarm_main():
             RT["warming"] = "No data in data/ — add CSVs"; return
         RT["warming"] = f"building precomps ({len(df):,} bars, cap {MAX_BARS}/TF)..."
         states = {}
-        for tf, rule, rr in TFS:
+        for tf, rule, rr, name in TFS:
             rdf = resample(df, rule)
             if MAX_BARS and len(rdf) > MAX_BARS:
                 rdf = rdf.iloc[-MAX_BARS:].reset_index(drop=True)
             if len(rdf) < 20:
                 continue
             pre = get_precomp(rdf); del rdf
-            st = TFState(tf, rr, pre); states[tf] = st
+            st = TFState(tf, rr, pre, name); states[tf] = st
             # seed HIGH-TRADE (loose-filter) genomes so the swarm starts with VOLUME, not 1-trade flukes
             base = UnifiedGenome()
             base.ind_conf = 1; base.range_atr = 0.3; base.min_body = 0.2; base.close_pos_min = 0.5
@@ -264,7 +262,7 @@ th,td{padding:8px 9px;text-align:left;border-bottom:1px solid #243150}th{color:v
 </div>
 <script>
 const $=id=>document.getElementById(id);
-const ORDER=["1m","5m","15m","1H","4H","1D"];
+const ORDER=["1m","3m","5m","15m"];
 async function tick(){
  try{
   const d=await (await fetch('/api/state')).json();
@@ -273,7 +271,7 @@ async function tick(){
   $('na').textContent = (d.total_agents||0)+' agents';
   $('ev').textContent = (d.total_evals||0).toLocaleString();
   const A=d.agents||{}, B=d.baseline||{}; const keys=ORDER.filter(k=>A[k]);
-  $('tf').textContent = keys.length+' / 6';
+  $('tf').textContent = keys.length+' / 4';
   let rows='';
   keys.forEach(k=>{
     const a=A[k], b=B[k]||{};

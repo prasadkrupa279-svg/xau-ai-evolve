@@ -1,0 +1,372 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// Arena Unified Liquidity — LIVE v2 (market-analysis enhanced, toggleable A/B)
+// Keeps your EXACT original logic/sessions/models (so it runs identically on TV).
+// ADDS 3 market-analysis upgrades targeting the weak timeframes (30m/45m PF~1.1-1.3):
+//   (1) ADX regime filter  (2) tight market-structure stops  (3) stronger displacement
+// Each is an input toggle -> verify ON vs OFF in the Strategy Tester on TradingView.
+//@version=6
+indicator("Arena Unified Liquidity [LIVE v2 | Enhanced]", overlay=true, max_labels_count=100, max_lines_count=20)
+
+//====================================================
+// INPUTS
+//====================================================
+groupCore = "Core"
+asianSession = input.session("2000-0259", "Asian Range Build", group=groupCore)
+sessionTZ = input.string("America/New_York", "Session Timezone", group=groupCore)
+commissionPct = input.float(0.02, "Virtual Commission % Per Fill", minval=0.0, step=0.01, group=groupCore)
+stopBufferTicks = input.int(2, "Stop Buffer Ticks", minval=0, group=groupCore)
+
+groupEnh = "Market-Analysis Enhancements (A/B test on TV)"
+useRegimeFilter = input.bool(true, "[1] ADX Regime Filter (cut chop)", group=groupEnh)
+regimeMin = input.float(22.0, "    Min ADX", minval=10.0, step=1.0, group=groupEnh)
+useTightStops = input.bool(true, "[2] Tight Structure Stops (market-based)", group=groupEnh)
+swingStopLen = input.int(3, "    Swing lookback (bars)", minval=2, maxval=10, group=groupEnh)
+useStrongDisp = input.bool(true, "[3] Strong Displacement Filter", group=groupEnh)
+strongDispBody = input.float(0.55, "    Min body %", minval=0.3, step=0.05, group=groupEnh)
+strongDispClose = input.float(0.70, "    Min close pos", minval=0.5, step=0.05, group=groupEnh)
+
+groupVisual = "Display"
+showEMAs = input.bool(true, "Show EMA 21 / 200", group=groupVisual)
+showAsian = input.bool(true, "Show Asian High/Low", group=groupVisual)
+showSignals = input.bool(true, "Show BUY/SELL Signals", group=groupVisual)
+showDashboard = input.bool(true, "Show Dashboard", group=groupVisual)
+enableLiveExitAlerts = input.bool(true, "Live SL/TP Exit Alerts", group=groupVisual)
+
+//====================================================
+// HELPERS / TIMEFRAME PRESETS
+//====================================================
+inSession(sess) => not na(time(timeframe.period, sess, sessionTZ))
+safeDiv(num, den) => den == 0.0 ? 0.0 : num / den
+fmtPrice(v) => na(v) ? "NA" : str.tostring(v, format.mintick)
+
+tfMinutes = timeframe.in_seconds() / 60.0
+is1m = timeframe.isminutes and tfMinutes == 1.0
+is3m = timeframe.isminutes and tfMinutes == 3.0
+is5m = timeframe.isminutes and tfMinutes == 5.0
+is15m = timeframe.isminutes and tfMinutes == 15.0
+is30m = timeframe.isminutes and tfMinutes == 30.0
+is45m = timeframe.isminutes and tfMinutes == 45.0
+is1H = timeframe.isintraday and tfMinutes == 60.0
+is2H = timeframe.isintraday and tfMinutes == 120.0
+is3H = timeframe.isintraday and tfMinutes == 180.0
+is4H = timeframe.isintraday and tfMinutes == 240.0
+is1D = timeframe.isdaily and timeframe.multiplier == 1
+isLowTF = is1m or is3m or is5m
+isHighTF = is30m or is45m or is1H or is2H or is3H or is4H or is1D
+validTimeframe = isLowTF or is15m or isHighTF
+
+rrTarget = isLowTF ? 3.00 : is15m ? 2.50 : is1D ? 1.00 : 2.00
+barsAfterSweep = is1m ? 96 : is3m ? 24 : 64
+rangeATR = is1m ? 1.30 : 0.50
+minimumBody = is1m ? 0.35 : is3m ? 0.35 : 0.50
+minimumStopATR = is1m ? 3.00 : is3m ? 3.00 : 2.00
+cooldownBars = is1m ? 2 : is3m ? 3 : 1
+confirmationEnd = is1m ? 540 : is3m ? 480 : 600
+
+//====================================================
+// INDICATORS + HIGHER-TIMEFRAME TREND
+//====================================================
+ema5 = ta.ema(close, 5); ema9 = ta.ema(close, 9); ema13 = ta.ema(close, 13)
+ema21 = ta.ema(close, 21); ema200 = ta.ema(close, 200)
+atrV = ta.atr(14); vwapV = ta.vwap(hlc3)
+[diPlus, diMinus, adxV] = ta.dmi(14, 14)
+regimeOK = not useRegimeFilter or adxV >= regimeMin      // [1] ADX regime gate
+
+dailyClose = request.security(syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_on)
+dailyEMA200 = request.security(syminfo.tickerid, "D", ta.ema(close, 200)[1], lookahead=barmerge.lookahead_on)
+h1Close = request.security(syminfo.tickerid, "60", close[1], lookahead=barmerge.lookahead_on)
+h1EMA20 = request.security(syminfo.tickerid, "60", ta.ema(close, 20)[1], lookahead=barmerge.lookahead_on)
+h1EMA50 = request.security(syminfo.tickerid, "60", ta.ema(close, 50)[1], lookahead=barmerge.lookahead_on)
+h1EMA200 = request.security(syminfo.tickerid, "60", ta.ema(close, 200)[1], lookahead=barmerge.lookahead_on)
+m15Close = request.security(syminfo.tickerid, "15", close[1], lookahead=barmerge.lookahead_on)
+m15EMA21 = request.security(syminfo.tickerid, "15", ta.ema(close, 21)[1], lookahead=barmerge.lookahead_on)
+m15EMA50 = request.security(syminfo.tickerid, "15", ta.ema(close, 50)[1], lookahead=barmerge.lookahead_on)
+h4Close = request.security(syminfo.tickerid, "240", close[1], lookahead=barmerge.lookahead_on)
+h4EMA20 = request.security(syminfo.tickerid, "240", ta.ema(close, 20)[1], lookahead=barmerge.lookahead_on)
+h4EMA50 = request.security(syminfo.tickerid, "240", ta.ema(close, 50)[1], lookahead=barmerge.lookahead_on)
+h4EMA200 = request.security(syminfo.tickerid, "240", ta.ema(close, 200)[1], lookahead=barmerge.lookahead_on)
+
+dailyBull = dailyClose > dailyEMA200; dailyBear = dailyClose < dailyEMA200
+h1Bull = h1Close > h1EMA50 and h1EMA20 > h1EMA50 and h1EMA50 > h1EMA200
+h1Bear = h1Close < h1EMA50 and h1EMA20 < h1EMA50 and h1EMA50 < h1EMA200
+m15Bull = m15Close > m15EMA21 and m15EMA21 > m15EMA50
+m15Bear = m15Close < m15EMA21 and m15EMA21 < m15EMA50
+h4Bull = h4Close > h4EMA50 and h4EMA20 > h4EMA50 and h4EMA50 > h4EMA200
+h4Bear = h4Close < h4EMA50 and h4EMA20 < h4EMA50 and h4EMA50 < h4EMA200
+bullWave = ema5 > ema9 and ema9 > ema13 and ema13 > ema21 and close > ema200
+bearWave = ema5 < ema9 and ema9 < ema13 and ema13 < ema21 and close < ema200
+lowLongBias = is3m ? (h1Bull and h4Bull) : (dailyBull and h1Bull and h4Bull)
+lowShortBias = is3m ? (h1Bear and h4Bear) : (dailyBear and h1Bear and h4Bear)
+
+//====================================================
+// ASIAN RANGE + SWEEP
+//====================================================
+inAsian = inSession(asianSession)
+var float asiaHigh = na; var float asiaLow = na
+if inAsian and not inAsian[1]
+    asiaHigh := high; asiaLow := low
+else if inAsian
+    asiaHigh := math.max(nz(asiaHigh, high), high); asiaLow := math.min(nz(asiaLow, low), low)
+
+nyMinutes = hour(time, sessionTZ) * 60 + minute(time, sessionTZ)
+inSweepWindow = nyMinutes >= 180 and nyMinutes < 390
+inConfirmWindow = nyMinutes >= 180 and nyMinutes < confirmationEnd
+
+refHigh3 = ta.highest(high[1], 3); refLow3 = ta.lowest(low[1], 3)
+refHigh5 = ta.highest(high[1], 5); refLow5 = ta.lowest(low[1], 5)
+refHigh10 = ta.highest(high[1], 10); refLow10 = ta.lowest(low[1], 10)
+refHigh20 = ta.highest(high[1], 20); refLow20 = ta.lowest(low[1], 20)
+refHigh30 = ta.highest(high[1], 30); refLow30 = ta.lowest(low[1], 30)
+
+var bool bullPending = false; var bool bearPending = false
+var int bullSweepBar = na; var int bearSweepBar = na
+var float bullSweepLow = na; var float bullSweepHigh = na
+var float bearSweepHigh = na; var float bearSweepLow = na
+var float bullStructureRef = na; var float bearStructureRef = na
+
+bullSweepNow = isLowTF and inSweepWindow and not na(asiaLow) and low < asiaLow and close > asiaLow
+bearSweepNow = isLowTF and inSweepWindow and not na(asiaHigh) and high > asiaHigh and close < asiaHigh
+if bullSweepNow
+    bullPending := true; bullSweepBar := bar_index; bullSweepLow := low; bullSweepHigh := high
+    bullStructureRef := is3m ? refHigh10 : is5m ? refHigh30 : refHigh3
+if bearSweepNow
+    bearPending := true; bearSweepBar := bar_index; bearSweepHigh := high; bearSweepLow := low
+    bearStructureRef := is3m ? refLow10 : is5m ? refLow30 : refLow3
+if bullPending and not na(bullSweepBar) and bar_index - bullSweepBar > barsAfterSweep
+    bullPending := false
+if bearPending and not na(bearSweepBar) and bar_index - bearSweepBar > barsAfterSweep
+    bearPending := false
+
+//====================================================
+// CONFIRMATION / LOW-TF SIGNALS
+//====================================================
+barRange = math.max(high - low, syminfo.mintick)
+bodyPct = safeDiv(math.abs(close - open), barRange)
+closePosLong = safeDiv(close - low, barRange); closePosShort = safeDiv(high - close, barRange)
+rangePass = (high - low) >= atrV * rangeATR
+strongBull = close > open and bodyPct >= minimumBody and closePosLong >= 0.65
+strongBear = close < open and bodyPct >= minimumBody and closePosShort >= 0.65
+bullConfirm = is1m ? (bar_index >= 2 and low > high[2]) : close > bullStructureRef
+bearConfirm = is1m ? (bar_index >= 2 and high < low[2]) : close < bearStructureRef
+
+nyHour = hour(time, sessionTZ); nyDay = dayofweek
+longLossFilter = is1m ? (nyHour == 3 or nyHour == 5 or nyHour == 6) : is5m ? (nyDay != dayofweek.wednesday and nyHour != 7) : true
+shortLossFilter = is3m
+londonLongCandidate = validTimeframe and bullPending and bar_index > bullSweepBar and inConfirmWindow and rangePass and strongBull and lowLongBias and bullConfirm and longLossFilter
+londonShortCandidate = isLowTF and bearPending and bar_index > bearSweepBar and inConfirmWindow and rangePass and strongBear and lowShortBias and bearConfirm and shortLossFilter
+
+// [2] tight structure stops
+swingLo = ta.lowest(low, swingStopLen); swingHi = ta.highest(high, swingStopLen)
+londonLongSLraw = is3m ? math.min(low, close - atrV * minimumStopATR) : math.min(math.min(bullSweepLow, low), close - atrV * minimumStopATR)
+londonShortSLraw = is3m ? math.max(high, close + atrV * minimumStopATR) : math.max(math.max(bearSweepHigh, high), close + atrV * minimumStopATR)
+londonLongSL = useTightStops ? math.min(londonLongSLraw, swingLo) - syminfo.mintick * stopBufferTicks : londonLongSLraw - syminfo.mintick * stopBufferTicks
+londonShortSL = useTightStops ? math.max(londonShortSLraw, swingHi) + syminfo.mintick * stopBufferTicks : londonShortSLraw + syminfo.mintick * stopBufferTicks
+
+//====================================================
+// LONDON RANGE -> NY SWEEP (second setup)
+//====================================================
+inLondonRangeBuild = nyMinutes >= 180 and nyMinutes < 480
+var float londonRangeHigh = na; var float londonRangeLow = na
+if inLondonRangeBuild and not inLondonRangeBuild[1]
+    londonRangeHigh := high; londonRangeLow := low
+else if inLondonRangeBuild
+    londonRangeHigh := math.max(nz(londonRangeHigh, high), high); londonRangeLow := math.min(nz(londonRangeLow, low), low)
+inNYSweepWindow = nyMinutes >= 480 and nyMinutes < 690
+nyRangeATR = is1m ? 1.10 : 0.70; nyBodyMin = is1m ? 0.50 : is3m ? 0.65 : 0.75; nyStopATR = is1m ? 3.00 : is3m ? 2.50 : 1.50
+nyLongBias = is5m ? (dailyBull and h1Bull and h4Bull) : (h1Bull and h4Bull and m15Bull)
+nyShortBias = is5m ? (dailyBear and h1Bear and h4Bear) : (h1Bear and h4Bear and m15Bear)
+var bool nyBullPending = false; var bool nyBearPending = false
+var int nyBullSweepBar = na; var int nyBearSweepBar = na
+var float nyBullSweepLow = na; var float nyBearSweepHigh = na
+var float nyBullRef = na; var float nyBearRef = na
+nyBullSweep = isLowTF and inNYSweepWindow and not na(londonRangeLow) and low < londonRangeLow and close > londonRangeLow
+nyBearSweep = isLowTF and inNYSweepWindow and not na(londonRangeHigh) and high > londonRangeHigh and close < londonRangeHigh
+if nyBullSweep
+    nyBullPending := true; nyBullSweepBar := bar_index; nyBullSweepLow := low; nyBullRef := is3m ? refHigh20 : refHigh5
+if nyBearSweep
+    nyBearPending := true; nyBearSweepBar := bar_index; nyBearSweepHigh := high; nyBearRef := is3m ? refLow20 : refLow5
+if nyBullPending and bar_index - nyBullSweepBar > (is1m ? 48 : is3m ? 48 : 8)
+    nyBullPending := false
+if nyBearPending and bar_index - nyBearSweepBar > (is1m ? 48 : is3m ? 48 : 8)
+    nyBearPending := false
+nyStrongBull = close > open and bodyPct >= nyBodyMin and closePosLong >= 0.65
+nyStrongBear = close < open and bodyPct >= nyBodyMin and closePosShort >= 0.65
+nyBullConfirm = is1m ? close > high[1] : is3m ? close > nyBullRef : (bar_index >= 2 and low > high[2])
+nyBearConfirm = is1m ? close < low[1] : is3m ? close < nyBearRef : (bar_index >= 2 and high < low[2])
+nyLongCandidate = nyBullPending and bar_index > nyBullSweepBar and inNYSweepWindow and (high-low) >= atrV*nyRangeATR and nyStrongBull and nyLongBias and nyBullConfirm
+nyShortCandidate = nyBearPending and bar_index > nyBearSweepBar and inNYSweepWindow and (high-low) >= atrV*nyRangeATR and nyStrongBear and nyShortBias and nyBearConfirm
+nyLongSLraw = is3m ? math.min(low, close - atrV * nyStopATR) : math.min(math.min(nyBullSweepLow, low), close - atrV * nyStopATR)
+nyShortSLraw = is3m ? math.max(high, close + atrV * nyStopATR) : math.max(math.max(nyBearSweepHigh, high), close + atrV * nyStopATR)
+nyLongSL = useTightStops ? math.min(nyLongSLraw, swingLo) - syminfo.mintick * stopBufferTicks : nyLongSLraw - syminfo.mintick * stopBufferTicks
+nyShortSL = useTightStops ? math.max(nyShortSLraw, swingHi) + syminfo.mintick * stopBufferTicks : nyShortSLraw + syminfo.mintick * stopBufferTicks
+
+//====================================================
+// HIGH-TF ADAPTIVE MODEL (30m..1D) — now with regime + disp
+//====================================================
+highFresh = is1D ? 24 : (is30m or is45m or is1H or is2H) ? 96 : 48
+highRangeATR = is1D ? 0.0 : (is30m or is1H) ? 0.60 : 0.50
+highStopATR = is1D ? 0.0 : (is30m or is1H) ? 1.50 : 1.00
+highADXMin = (is30m or is1H) ? 20.0 : 18.0
+highStrictLong = dailyBull and bullWave and adxV >= highADXMin and diPlus > diMinus and close > vwapV
+highStrictShort = dailyBear and bearWave and adxV >= highADXMin and diMinus > diPlus and close < vwapV
+highLongBias = is1D ? (close > ema21 and close > ema200) : highStrictLong
+highShortBias = is1D ? (close < ema21 and close < ema200) : highStrictShort
+highBullSweepNow = isHighTF and (is1D ? (low < low[1] and close > low[1]) : (not na(asiaLow) and low < asiaLow and close > asiaLow))
+highBearSweepNow = isHighTF and (is1D ? (high > high[1] and close < high[1]) : (not na(asiaHigh) and high > asiaHigh and close < asiaHigh))
+var int highBullSweepBar = na; var int highBearSweepBar = na
+if highBullSweepNow
+    highBullSweepBar := bar_index
+if highBearSweepNow
+    highBearSweepBar := bar_index
+highBullFresh = not na(highBullSweepBar) and bar_index - highBullSweepBar <= highFresh
+highBearFresh = not na(highBearSweepBar) and bar_index - highBearSweepBar <= highFresh
+highRangePass = highRangeATR <= 0.0 or (high - low) >= atrV * highRangeATR
+// [3] stronger displacement when enabled
+hdBody = useStrongDisp ? strongDispBody : 0.35
+hdClose = useStrongDisp ? strongDispClose : 0.65
+highStrongBull = close > open and bodyPct >= hdBody and closePosLong >= hdClose
+highStrongBear = close < open and bodyPct >= hdBody and closePosShort >= hdClose
+highLongTrigger = (is45m or is2H) ? (highStrongBull and close > high[1]) : close > open
+highShortTrigger = (is45m or is2H) ? (highStrongBear and close < low[1]) : close < open
+highLongRaw = isHighTF and highBullFresh and highLongBias and highLongTrigger and close > ema21 and highRangePass and regimeOK
+highShortRaw = isHighTF and highBearFresh and highShortBias and highShortTrigger and close < ema21 and highRangePass and regimeOK
+var int lastHighLongBar = na; var int lastHighShortBar = na
+highLongSignal = barstate.isconfirmed and highLongRaw and (na(lastHighLongBar) or bar_index - lastHighLongBar > (is1D ? 0 : (is30m or is1H) ? 3 : 2))
+highShortSignal = barstate.isconfirmed and highShortRaw and (na(lastHighShortBar) or bar_index - lastHighShortBar > (is1D ? 0 : (is30m or is1H) ? 3 : 2))
+if highLongSignal
+    lastHighLongBar := bar_index
+if highShortSignal
+    lastHighShortBar := bar_index
+highLongSLraw = highStopATR > 0.0 ? math.min(low, close - atrV * highStopATR) : low
+highShortSLraw = highStopATR > 0.0 ? math.max(high, close + atrV * highStopATR) : high
+highLongSL = useTightStops ? math.min(highLongSLraw, swingLo) : highLongSLraw
+highShortSL = useTightStops ? math.max(highShortSLraw, swingHi) : highShortSLraw
+
+//====================================================
+// 15M MODEL
+//====================================================
+var bool m15BullPending = false; var bool m15BearPending = false
+var int m15BullSweepBar = na; var int m15BearSweepBar = na
+var float m15SweepLow = na; var float m15SweepHigh = na
+var float m15BullRef = na; var float m15BearRef = na
+m15BullSweep = is15m and inSweepWindow and not na(asiaLow) and low < asiaLow and close > asiaLow
+m15BearSweep = is15m and inSweepWindow and not na(asiaHigh) and high > asiaHigh and close < asiaHigh
+if m15BullSweep
+    m15BullPending := true; m15BullSweepBar := bar_index; m15SweepLow := low; m15BullRef := high[1]
+if m15BearSweep
+    m15BearPending := true; m15BearSweepBar := bar_index; m15SweepHigh := high; m15BearRef := low[1]
+if m15BullPending and bar_index - m15BullSweepBar > 4
+    m15BullPending := false
+if m15BearPending and bar_index - m15BearSweepBar > 4
+    m15BearPending := false
+m15LongRaw = is15m and m15BullPending and bar_index > m15BullSweepBar and (nyMinutes >= 180 and nyMinutes < 390) and (high-low) >= atrV*0.50 and close>open and bodyPct>=0.65 and closePosLong>=0.65 and dailyBull and close>m15BullRef and regimeOK
+m15ShortRaw = is15m and m15BearPending and bar_index > m15BearSweepBar and (nyMinutes >= 180 and nyMinutes < 390) and (high-low) >= atrV*0.50 and close<open and bodyPct>=0.65 and closePosShort>=0.65 and dailyBear and close<m15BearRef and regimeOK
+m15LongSignal = barstate.isconfirmed and m15LongRaw
+m15ShortSignal = barstate.isconfirmed and m15ShortRaw
+if m15LongSignal
+    m15BullPending := false
+if m15ShortSignal
+    m15BearPending := false
+m15LongSLraw = math.min(math.min(m15SweepLow,low),close-atrV*3.0)
+m15ShortSLraw = math.max(math.max(m15SweepHigh,high),close+atrV*3.0)
+m15LongSL = useTightStops ? math.min(m15LongSLraw, swingLo) : m15LongSLraw
+m15ShortSL = useTightStops ? math.max(m15ShortSLraw, swingHi) : m15ShortSLraw
+
+//====================================================
+// UNION + VIRTUAL TRADE ENGINE (SL-guard, one trade)
+//====================================================
+lowLongSignal = barstate.isconfirmed and (londonLongCandidate or nyLongCandidate)
+lowShortSignal = barstate.isconfirmed and (londonShortCandidate or nyShortCandidate)
+longSignal = lowLongSignal or m15LongSignal or highLongSignal
+shortSignal = lowShortSignal or m15ShortSignal or highShortSignal
+lowLongSL = londonLongCandidate and nyLongCandidate ? math.min(londonLongSL, nyLongSL) : nyLongCandidate ? nyLongSL : londonLongSL
+lowShortSL = londonShortCandidate and nyShortCandidate ? math.max(londonShortSL, nyShortSL) : nyShortCandidate ? nyShortSL : londonShortSL
+longSLBase = isLowTF ? lowLongSL : is15m ? m15LongSL : highLongSL
+shortSLBase = isLowTF ? lowShortSL : is15m ? m15ShortSL : highShortSL
+
+commissionRate = commissionPct / 100.0
+varip int virtualPosition = 0
+varip float entryPrice = na; varip float stopPrice = na; varip float targetPrice = na
+varip float entryCommission = na
+varip int totalTrades = 0; varip int winTrades = 0; varip int lossTrades = 0
+varip float netPnL = 0.0; varip float grossProfit = 0.0; varip float grossLoss = 0.0
+float exitPrice = na; string exitReason = ""
+if virtualPosition != 0
+    if virtualPosition == 1
+        if open <= stopPrice
+            exitPrice := open; exitReason := "SL GAP"
+        else if open >= targetPrice
+            exitPrice := open; exitReason := "TP GAP"
+        else
+            hitSL = low <= stopPrice; hitTP = high >= targetPrice
+            if hitSL and hitTP
+                hf = math.abs(high - open) < math.abs(open - low); exitPrice := hf ? targetPrice : stopPrice; exitReason := hf ? "TP" : "SL"
+            else if hitSL
+                exitPrice := stopPrice; exitReason := "SL"
+            else if hitTP
+                exitPrice := targetPrice; exitReason := "TP"
+    else
+        if open >= stopPrice
+            exitPrice := open; exitReason := "SL GAP"
+        else if open <= targetPrice
+            exitPrice := open; exitReason := "TP GAP"
+        else
+            hitSL = high >= stopPrice; hitTP = low <= targetPrice
+            if hitSL and hitTP
+                hf = math.abs(high - open) < math.abs(open - low); exitPrice := hf ? stopPrice : targetPrice; exitReason := hf ? "SL" : "TP"
+            else if hitSL
+                exitPrice := stopPrice; exitReason := "SL"
+            else if hitTP
+                exitPrice := targetPrice; exitReason := "TP"
+    if not na(exitPrice)
+        pnl = virtualPosition * (exitPrice - entryPrice) - entryCommission - math.abs(exitPrice) * commissionRate
+        totalTrades += 1; netPnL += pnl
+        if pnl > 0
+            winTrades += 1; grossProfit += pnl
+        else
+            lossTrades += 1; grossLoss += math.abs(pnl)
+        virtualPosition := 0
+        if enableLiveExitAlerts and barstate.isrealtime
+            alert("Arena " + exitReason + " | " + syminfo.ticker + " | Exit " + fmtPrice(exitPrice) + " | PnL " + str.tostring(pnl, "#.##"), alert.freq_all)
+
+bool executedLongSignal = false; bool executedShortSignal = false
+if barstate.isconfirmed and virtualPosition == 0 and (longSignal or shortSignal)
+    isLongEntry = longSignal
+    executedLongSignal := isLongEntry; executedShortSignal := not isLongEntry
+    virtualPosition := isLongEntry ? 1 : -1
+    entryPrice := close
+    stopPrice := longSLBase
+    risk = math.max(math.abs(entryPrice - stopPrice), syminfo.mintick)
+    targetPrice := isLongEntry ? entryPrice + risk * rrTarget : entryPrice - risk * rrTarget
+    entryCommission := math.abs(entryPrice) * commissionRate
+
+//====================================================
+// VISUALS / DASHBOARD
+//====================================================
+plot(showEMAs ? ema21 : na, "EMA 21", color=color.yellow, linewidth=2)
+plot(showEMAs ? ema200 : na, "EMA 200", color=color.aqua, linewidth=2)
+plot(showAsian ? asiaHigh : na, "Asian High", color=color.new(color.red, 35), style=plot.style_linebr)
+plot(showAsian ? asiaLow : na, "Asian Low", color=color.new(color.green, 35), style=plot.style_linebr)
+plotshape(showSignals and executedLongSignal, title="BUY", style=shape.triangleup, location=location.belowbar, color=color.rgb(0, 255, 110), size=size.large, text="BUY", textcolor=color.black)
+plotshape(showSignals and executedShortSignal, title="SELL", style=shape.triangledown, location=location.abovebar, color=color.rgb(255, 25, 70), size=size.large, text="SELL", textcolor=color.white)
+bgcolor(not validTimeframe ? color.new(color.red, 88) : na, title="Unsupported timeframe")
+alertcondition(executedLongSignal, title="Arena BUY", message="Arena BUY on {{ticker}} {{interval}}")
+alertcondition(executedShortSignal, title="Arena SELL", message="Arena SELL on {{ticker}} {{interval}}")
+
+winRate = totalTrades > 0 ? winTrades * 100.0 / totalTrades : na
+profitFactor = grossLoss > 0 ? grossProfit / grossLoss : na
+status = virtualPosition == 1 ? "LONG" : virtualPosition == -1 ? "SHORT" : "FLAT"
+var table dash = table.new(position.top_right, 2, 11, frame_color=color.new(color.gray, 55), border_width=1)
+if barstate.islast and showDashboard
+    table.cell(dash, 0, 0, "ARENA LIVE v2", bgcolor=color.new(color.blue, 20), text_color=color.white)
+    table.cell(dash, 1, 0, "Enhanced", bgcolor=color.new(color.blue, 20), text_color=color.white)
+    table.cell(dash, 0, 1, "Status", text_color=color.white); table.cell(dash, 1, 1, status, text_color=color.white)
+    table.cell(dash, 0, 2, "Trades", text_color=color.white); table.cell(dash, 1, 2, str.tostring(totalTrades), text_color=color.white)
+    table.cell(dash, 0, 3, "Win Rate", text_color=color.white); table.cell(dash, 1, 3, na(winRate) ? "NA" : str.tostring(winRate, "#.##") + "%", text_color=color.white)
+    table.cell(dash, 0, 4, "Profit Factor", text_color=color.white); table.cell(dash, 1, 4, na(profitFactor) ? "NA" : str.tostring(profitFactor, "#.##"), text_color=color.white)
+    table.cell(dash, 0, 5, "Net", text_color=color.white); table.cell(dash, 1, 5, str.tostring(netPnL, "#.##"), text_color=color.white)
+    table.cell(dash, 0, 6, "RR", text_color=color.white); table.cell(dash, 1, 6, "1:" + str.tostring(rrTarget, "#.##"), text_color=color.white)
+    table.cell(dash, 0, 7, "ADX", text_color=color.white); table.cell(dash, 1, 7, str.tostring(adxV, "#.#") + (regimeOK ? " OK" : " chop"), text_color=color.white)
+    table.cell(dash, 0, 8, "Regime Filt", text_color=color.white); table.cell(dash, 1, 8, useRegimeFilter ? "ON" : "off", text_color=color.white)
+    table.cell(dash, 0, 9, "Tight Stops", text_color=color.white); table.cell(dash, 1, 9, useTightStops ? "ON" : "off", text_color=color.white)
+    table.cell(dash, 0, 10, "Strong Disp", text_color=color.white); table.cell(dash, 1, 10, useStrongDisp ? "ON" : "off", text_color=color.white)

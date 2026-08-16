@@ -13,9 +13,11 @@ RUN mkdir -p data memory
 ENV PYTHONUNBUFFERED=1 \
     PORT=10000 \
     DATA_DIR=data \
-    MEMORY_PATH=memory/global_ai_memory.json
+    AGENTS_PER_TF=5 \
+    MAX_BARS=0 \
+    MAX_M1_BARS=0
 
 EXPOSE 10000
 
-# 1 worker => exactly ONE evolution loop (avoid duplicate daemons writing memory)
-CMD gunicorn dashboard:app --bind 0.0.0.0:${PORT:-10000} --workers 1 --threads 8 --timeout 120
+# 1 worker => ONE swarm (90 agents) + dashboard in a single process
+CMD gunicorn render_swarm_app:app --bind 0.0.0.0:${PORT:-10000} --workers 1 --threads 8 --timeout 180

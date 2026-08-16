@@ -37,6 +37,11 @@ class UnifiedGenome:
     stop_buffer: float = 0.20
     cooldown: int = 2
     use_daily: bool = True; use_h1: bool = True; use_h4: bool = True
+    # faithful-add: 1m FVG confirmation (Pine: low>high[2]) vs structure break
+    confirm_mode: int = 0          # 0 = structure break, 1 = FVG
+    # faithful-add: entry-hour window (models Pine longLossFilter; -1 = off)
+    entry_hour_start: int = -1
+    entry_hour_end: int = -1
 
     def key(self) -> str:
         return hashlib.md5(json.dumps(asdict(self), sort_keys=True, default=str).encode()).hexdigest()[:12]
@@ -54,9 +59,9 @@ _CACHE: dict = {}
 class Precomp:
     def __init__(self, df: pd.DataFrame):
         self.n = len(df)
-        self.o = df["open"].to_numpy(float); self.h = df["high"].to_numpy(float)
-        self.l = df["low"].to_numpy(float); self.c = df["close"].to_numpy(float)
-        self.spread = df["spread"].to_numpy(float)
+        self.o = df["open"].to_numpy(np.float32); self.h = df["high"].to_numpy(np.float32)
+        self.l = df["low"].to_numpy(np.float32); self.c = df["close"].to_numpy(np.float32)
+        self.spread = df["spread"].to_numpy(np.float32)
         dt = pd.to_datetime(df["datetime"])
         self.mod = (dt.dt.hour * 60 + dt.dt.minute).to_numpy()
         self.times = dt.to_numpy()
@@ -73,8 +78,8 @@ class Precomp:
         self.refL10 = s_l.rolling(10, min_periods=1).min().to_numpy()
 
         self.daily_bull = self._htf("1D", lambda c, e: c > e[0])
-        self.h1_bull = self._htf("1H", lambda c, e: (c > e[1]) & (e[0] > e[1]) & (e[1] > e[2]))
-        self.h4_bull = self._htf("4H", lambda c, e: (c > e[1]) & (e[0] > e[1]) & (e[1] > e[2]))
+        self.h1_bull = self._htf("1h", lambda c, e: (c > e[1]) & (e[0] > e[1]) & (e[1] > e[2]))
+        self.h4_bull = self._htf("4h", lambda c, e: (c > e[1]) & (e[0] > e[1]) & (e[1] > e[2]))
 
     def _htf(self, rule, bullfn):
         cs = pd.Series(self.c, index=pd.Index(self.times)).resample(rule).last().dropna()
@@ -158,8 +163,21 @@ def run_backtest(df: pd.DataFrame, g: UnifiedGenome, pre: Precomp | None = None)
         if g.use_h4:
             blong &= pre.h4_bull; bshort &= ~pre.h4_bull
 
-        long_sig = bull_active & in_confirm & range_pass & strong_bull & blong & (c > bull_break)
-        short_sig = bear_active & in_confirm & range_pass & strong_bear & bshort & (c < bear_break)
+        # confirm condition: FVG (1m faithful) or structure break
+        if g.confirm_mode == 1:
+            h2 = np.empty(n); h2[:2] = np.nan; h2[2:] = h[:-2]
+            l2 = np.empty(n); l2[:2] = np.nan; l2[2:] = l[:-2]
+            bull_conf = (np.arange(n) >= 2) & (l > h2)
+            bear_conf = (np.arange(n) >= 2) & (h < l2)
+        else:
+            bull_conf = c > bull_break
+            bear_conf = c < bear_break
+        eh_mask = np.ones(n, dtype=bool)
+        if g.entry_hour_start >= 0 and g.entry_hour_end >= 0:
+            eh_mask = _in_window(pre.mod, g.entry_hour_start * 60, g.entry_hour_end * 60)
+
+        long_sig = bull_active & in_confirm & range_pass & strong_bull & blong & bull_conf & eh_mask
+        short_sig = bear_active & in_confirm & range_pass & strong_bear & bshort & bear_conf & eh_mask
         long_sig[:start] = False; short_sig[:start] = False
 
         rr, sm, buf = g.rr_target, g.min_stop_atr, g.stop_buffer

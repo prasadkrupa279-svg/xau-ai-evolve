@@ -24,19 +24,21 @@ COLS = ["date", "time", "open", "high", "low", "close", "tickvol", "vol", "sprea
 SPREAD_POINT = float(os.environ.get("SPREAD_POINT", "0.01"))
 
 
-def _read_one(path: str) -> pd.DataFrame:
-    # Header may or may not exist. If first row looks like '<DATE>', skip it.
+def _read_one(path: str, nrows: int | None = None) -> pd.DataFrame:
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         first = f.readline().strip()
     skiprows = 1 if first.lower().startswith("<date>") else 0
     df = pd.read_csv(
         path, sep="\t", header=None, skiprows=skiprows, names=COLS,
-        dtype=str, engine="python", on_bad_lines="skip",
+        dtype={"date": str, "time": str, "open": np.float32, "high": np.float32,
+               "low": np.float32, "close": np.float32, "tickvol": np.float32,
+               "vol": np.float32, "spread": np.float32},
+        engine="python", on_bad_lines="skip", nrows=nrows,
     )
     return df
 
 
-def load_data(data_dir: str = "data", files=None) -> pd.DataFrame | None:
+def load_data(data_dir: str = "data", files=None, nrows: int | None = None) -> pd.DataFrame | None:
     if files:
         paths = [os.path.join(data_dir, f) for f in files if os.path.exists(os.path.join(data_dir, f))]
     else:
@@ -48,7 +50,7 @@ def load_data(data_dir: str = "data", files=None) -> pd.DataFrame | None:
     parts = []
     for p in paths:
         try:
-            parts.append(_read_one(p))
+            parts.append(_read_one(p, nrows))
         except Exception as e:  # pragma: no cover
             print(f"[data_tools] WARN could not read {p}: {e}")
     if not parts:
@@ -59,9 +61,6 @@ def load_data(data_dir: str = "data", files=None) -> pd.DataFrame | None:
     dstr = df["date"].astype(str).str.replace(".", "-", regex=False)
     df["datetime"] = pd.to_datetime(dstr + " " + df["time"].astype(str), errors="coerce")
     df = df.dropna(subset=["datetime"])
-    for c in ("open", "high", "low", "close"):
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=("open", "high", "low", "close"))
     df = df.sort_values("datetime")
     df = df.drop_duplicates(subset="datetime", keep="last").reset_index(drop=True)
 
